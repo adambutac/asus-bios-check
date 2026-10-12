@@ -2,7 +2,8 @@
   Check-AsusBios.ps1
   Runs at login. Compares the installed BIOS version with the newest one on
   ASUS's support site and shows a Windows notification if an update exists.
-  Stays silent when up to date or when offline.
+  Stays silent when up to date or when offline. Log and state are kept in
+  %LOCALAPPDATA%\AsusBiosCheck.
 
   Network errors (e.g. a VPN still connecting) are retried with increasing
   waits for up to -MaxWaitMinutes. If no check has succeeded for
@@ -10,27 +11,46 @@
 
   -IncludeBeta     also notify about beta BIOS releases
   -Force           always show a notification (for testing)
-  -DelaySeconds    wait before the first attempt (default 30)
+  -DelaySeconds    wait before the first attempt (default 0; the login task
+                   already waits 30 seconds)
   -MaxWaitMinutes  keep retrying network errors this long (default 15)
   -WarnAfterDays   warn when checks have failed this long (default 7)
 #>
 param(
     [switch]$IncludeBeta,
     [switch]$Force,
-    [int]$DelaySeconds = 30,
+    [int]$DelaySeconds = 0,
     [int]$MaxWaitMinutes = 15,
     [int]$WarnAfterDays = 7
 )
 
 $ErrorActionPreference = 'Stop'
-$LogFile   = Join-Path $PSScriptRoot 'Check-AsusBios.log'
-$StateFile = Join-Path $PSScriptRoot 'Check-AsusBios.state.json'
-function Log($msg) { "$(Get-Date -Format s)  $msg" | Add-Content -Path $LogFile }
+$DataDir   = Join-Path $env:LOCALAPPDATA 'AsusBiosCheck'
+$LogFile   = Join-Path $DataDir 'Check-AsusBios.log'
+$StateFile = Join-Path $DataDir 'Check-AsusBios.state.json'
+New-Item -ItemType Directory -Force -Path $DataDir | Out-Null
+# One line per entry; some exception messages contain line breaks.
+function Log($msg) { "$(Get-Date -Format s)  $($msg -replace '\s*\r?\n\s*', ' ')" | Add-Content -Path $LogFile }
 
 # State: FirstRun, LastSuccess, LastWarning (ISO 8601 strings).
 function Get-State {
-    if (Test-Path $StateFile) { try { return Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
-    [pscustomobject]@{ FirstRun = (Get-Date -Format s); LastSuccess = $null; LastWarning = $null }
+    $state = [pscustomobject]@{ FirstRun = (Get-Date -Format s); LastSuccess = $null; LastWarning = $null }
+    if (Test-Path $StateFile) {
+        try {
+            $saved = Get-Content $StateFile -Raw | ConvertFrom-Json
+            # Copy known fields over the defaults, so a file missing any of them still works.
+            foreach ($name in 'FirstRun', 'LastSuccess', 'LastWarning') {
+                if ($saved.$name) { $state.$name = [string]$saved.$name }
+            }
+        }
+        catch {
+            # Keep the unreadable file for inspection, then start fresh.
+            $bad = "$StateFile.corrupt"
+            Move-Item $StateFile $bad -Force
+            Log "WARNING: state file was unreadable ($($_.Exception.Message)); moved to $bad and starting fresh"
+        }
+    }
+    $state
 }
 function Save-State($s) { $s | ConvertTo-Json | Set-Content $StateFile }
 
