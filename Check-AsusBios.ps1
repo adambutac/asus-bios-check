@@ -4,17 +4,48 @@
   ASUS's support site and shows a Windows notification if an update exists.
   Stays silent when up to date or when offline.
 
-  -IncludeBeta   also notify about beta BIOS releases
-  -Force         always show a notification (for testing)
-  -DelaySeconds  wait before checking (default 30, lets the network come up)
+  Network errors (e.g. a VPN still connecting) are retried with increasing
+  waits for up to -MaxWaitMinutes. If no check has succeeded for
+  -WarnAfterDays, a warning notification points to the log (at most once a day).
+
+  -IncludeBeta     also notify about beta BIOS releases
+  -Force           always show a notification (for testing)
+  -DelaySeconds    wait before the first attempt (default 30)
+  -MaxWaitMinutes  keep retrying network errors this long (default 15)
+  -WarnAfterDays   warn when checks have failed this long (default 7)
 #>
-param([switch]$IncludeBeta, [switch]$Force, [int]$DelaySeconds = 30)
+param(
+    [switch]$IncludeBeta,
+    [switch]$Force,
+    [int]$DelaySeconds = 30,
+    [int]$MaxWaitMinutes = 15,
+    [int]$WarnAfterDays = 7
+)
 
 $ErrorActionPreference = 'Stop'
-$LogFile = Join-Path $PSScriptRoot 'Check-AsusBios.log'
+$LogFile   = Join-Path $PSScriptRoot 'Check-AsusBios.log'
+$StateFile = Join-Path $PSScriptRoot 'Check-AsusBios.state.json'
 function Log($msg) { "$(Get-Date -Format s)  $msg" | Add-Content -Path $LogFile }
 
-function Show-Toast($title, $body, $url) {
+# State: FirstRun, LastSuccess, LastWarning (ISO 8601 strings).
+function Get-State {
+    if (Test-Path $StateFile) { try { return Get-Content $StateFile -Raw | ConvertFrom-Json } catch {} }
+    [pscustomobject]@{ FirstRun = (Get-Date -Format s); LastSuccess = $null; LastWarning = $null }
+}
+function Save-State($s) { $s | ConvertTo-Json | Set-Content $StateFile }
+
+# Errors that mean "the network isn't ready yet" and are worth retrying.
+function Test-Transient($err) {
+    $ex = $err.Exception
+    if ($ex -is [System.Net.WebException]) {
+        $resp = $ex.Response
+        if (-not $resp) { return $true }                      # DNS, connect, timeout, TLS
+        return [int]$resp.StatusCode -ge 500 -or [int]$resp.StatusCode -eq 429
+    }
+    return $ex -is [System.Net.Sockets.SocketException] -or $ex -is [System.TimeoutException]
+}
+
+function Show-Toast($title, $body, $url, $button = 'Open BIOS page') {
     [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
     [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
     $esc = [Security.SecurityElement]
@@ -25,13 +56,15 @@ function Show-Toast($title, $body, $url) {
     <text>$($esc::Escape($title))</text>
     <text>$($esc::Escape($body))</text>
   </binding></visual>
-  <actions><action content="Open BIOS page" activationType="protocol" arguments="$($esc::Escape($url))"/></actions>
+  <actions><action content="$($esc::Escape($button))" activationType="protocol" arguments="$($esc::Escape($url))"/></actions>
 </toast>
 "@)
     $appId = '{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe'
     [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier($appId).Show(
         [Windows.UI.Notifications.ToastNotification]::new($xml))
 }
+
+$state = Get-State
 
 try {
     # Give the network a moment to come up after login.
@@ -42,10 +75,20 @@ try {
 
     $api = 'https://www.asus.com/support/api/product.asmx/GetPDBIOS?website=global&cpu=&model=' +
            [Uri]::EscapeDataString($board)
-    $resp = $null
-    foreach ($attempt in 1..3) {
+
+    # Retry network errors with growing waits (30s, 60s, 120s, then 300s) until the deadline.
+    $deadline = (Get-Date).AddMinutes($MaxWaitMinutes)
+    $wait = 30
+    $attempt = 0
+    while ($true) {
+        $attempt++
         try { $resp = Invoke-RestMethod -Uri $api -UserAgent 'Mozilla/5.0' -TimeoutSec 30; break }
-        catch { if ($attempt -eq 3) { throw } ; Start-Sleep -Seconds 60 }
+        catch {
+            if (-not (Test-Transient $_) -or (Get-Date).AddSeconds($wait) -gt $deadline) { throw }
+            Log "attempt $attempt failed ($($_.Exception.Message)); retrying in $wait s"
+            Start-Sleep -Seconds $wait
+            $wait = [Math]::Min($wait * 2, 300)
+        }
     }
     if ($resp.Status -ne 'SUCCESS') { throw "ASUS API returned status '$($resp.Status)' for model '$board'" }
 
@@ -57,6 +100,8 @@ try {
     $isNewer = [int]$latest.Version -gt [int]$installed
     $beta    = if ($latest.IsRelease -eq 1) { '' } else { ' (beta)' }
     Log "board='$board' installed=$installed latest=$($latest.Version)$beta newer=$isNewer"
+    $state.LastSuccess = Get-Date -Format s
+    Save-State $state
 
     if ($isNewer -or $Force) {
         $page = 'https://www.asus.com/supportonly/' + [Uri]::EscapeDataString($board.ToLower()) + '/helpdesk_bios/'
@@ -68,6 +113,18 @@ try {
 }
 catch {
     Log "ERROR: $($_.Exception.Message)"
+
+    # Offline now and then is normal; failing for days means something is broken.
+    $since = if ($state.LastSuccess) { [datetime]$state.LastSuccess } else { [datetime]$state.FirstRun }
+    $warnedRecently = $state.LastWarning -and ([datetime]$state.LastWarning) -gt (Get-Date).AddDays(-1)
+    if (((Get-Date) - $since).TotalDays -ge $WarnAfterDays -and -not $warnedRecently) {
+        $last = if ($state.LastSuccess) { "Last successful check: $($since.ToString('yyyy-MM-dd'))" } else { 'It has never succeeded.' }
+        try {
+            Show-Toast 'BIOS update check is failing' "$last`n$($_.Exception.Message)" ([Uri]$LogFile).AbsoluteUri 'Open log'
+            $state.LastWarning = Get-Date -Format s
+        } catch { Log "ERROR showing warning: $($_.Exception.Message)" }
+    }
+    Save-State $state
 }
 
 # Keep the log small.
