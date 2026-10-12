@@ -46,3 +46,7 @@ Both time limits are settings at the top of `Check-AsusBios.ps1`.
 
 - This only notifies you. Flash the BIOS from the BIOS itself (EZ Flash 3) with the file on a USB drive. If the release notes mention fTPM, suspend BitLocker first.
 - BIOS versions are compared as whole numbers, which is how ASUS numbers desktop boards. Laptop-style versions aren't supported.
+
+## License
+
+[MIT](LICENSE)
