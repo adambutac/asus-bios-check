@@ -45,7 +45,7 @@ if (-not (Test-Path $LastSuccess)) { Set-Content $LastSuccess (Get-Date -Format 
 try {
     $board     = (Get-CimInstance Win32_BaseBoard).Product
     $installed = (Get-CimInstance Win32_BIOS).SMBIOSBIOSVersion
-    $api = 'https://www.asus.com/support/api/product.asmx/GetPDBIOS?website=global&cpu=&model=' +
+    $api = 'https://www.asus.com/support/webapi/ProductV2/GetPDBIOS?website=global&cpu=&model=' +
            [Uri]::EscapeDataString($board)
 
     # Retry once a minute until the request works or time runs out.
